@@ -1,0 +1,10 @@
+paddlepaddle==3.3.1
+paddlex[ocr]==3.7.2
+latex2mathml==3.81.1
+lxml==6.1.3
+pillow==12.3.0
+# M2 工程壳：托盘（capture/tray 用 ctypes+tkinter，属标准库不列）；
+# preview.py 依赖本机 node + spike/model/node_modules/katex（非 pip 资产）
+pystray==0.19.5
+# M2 结果浮卡（ui/formula_card.py，des-1 车道）；主 venv 缺失时 tray_app 自动降级
+PySide6>=6.6,<7

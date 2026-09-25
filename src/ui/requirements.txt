@@ -1,0 +1,2 @@
+# SnipEq UI 浮卡（车道B）独立依赖；集成时以 src/requirements.txt（fix-5）为准
+PySide6>=6.6,<7

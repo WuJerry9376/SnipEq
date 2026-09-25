@@ -1,0 +1,13 @@
+# SnipEq M1 — 公式识别 pipeline 配置
+# vendor 自 spike/model/formula_pipeline_S.yaml，M1 转正（内容与 spike 一致）
+pipeline_name: formula_recognition
+
+use_layout_detection: False
+use_doc_preprocessor: False
+
+SubModules:
+  FormulaRecognition:
+    module_name: formula_recognition
+    model_name: PP-FormulaNet_plus-S
+    model_dir: null
+    batch_size: 1

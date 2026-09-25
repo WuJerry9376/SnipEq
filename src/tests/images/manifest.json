@@ -1,0 +1,6 @@
+{
+ "frac_sum": "\\frac{\\sum_{i=1}^{n} i^{2}}{n}=\\frac{(n+1)(2n+1)}{6}",
+ "cases": "f(x)=\\begin{cases}x^{2}, & x\\geq 0\\\\ -x, & x<0\\end{cases}",
+ "matrix": "\\begin{pmatrix}a & b\\\\ c & d\\end{pmatrix}^{-1}=\\frac{1}{ad-bc}\\begin{pmatrix}d & -b\\\\ -c & a\\end{pmatrix}",
+ "aligned": "\\begin{aligned}\\nabla\\cdot\\mathbf{E} &= \\frac{\\rho}{\\varepsilon_0}\\\\ \\nabla\\times\\mathbf{B} &= \\mu_0\\mathbf{J}\\end{aligned}"
+}

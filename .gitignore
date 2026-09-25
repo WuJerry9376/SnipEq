@@ -1,0 +1,30 @@
+# ── dev-only assets, not part of the public facade ──
+spike/
+word_verification/
+规划书.md
+*.pdf
+
+# ── build outputs ──
+package/SnipEq/
+package/_work/
+package/使用说明.txt
+*.zip
+*.7z
+
+# ── Python / Node ──
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+src/tests/_work/
+src/ui/shots/
+
+# ── runtime temp / logs ──
+snipeq_shot_*.png
+snipeq_preview/
+snipeq_preview*
+logs/
+*.log
+desktop.ini
+
+src/ui/_demo_tmp/
