@@ -126,6 +126,35 @@ Enter/主按钮=复制为 Word 公式，Esc 取消；菜单含零确认/空闲�
   卡片按钮禁用，路由逻辑 v1.1 接入。
 - 真卡冒烟以 `QT_QPA_PLATFORM=offscreen` 跑通（无头证据链：卡片展示/预览回填/
   copy 信号入剪贴板）；TkOverlay 人工框选交互（橡胶筋/Esc/Enter）仍需 dogfooding 验证。
+  （**M3e 已由办公机实测**：Enter 键确认链路存在 P0 卡死，见下节修复。）
+
+## M3e P0 修复（截图遮罩卡死 + 驻留内存增长，v0.1.1）
+
+办公机 dogfooding 实锤两条 P0，均已定位根因并结构性修复：
+
+- **P0-A 确认后遮罩不消失、整机假死**。根因链（采证见 `tests/repro_capture.py`）：
+  1. `TkOverlay.run()` 的 tray 复用分支用 `root.wait_window(top)` 等待，而
+     confirm/cancel 只设 `_done` 标志从不 destroy `top` → wait_window 永不返回
+     （M2 冒烟走注入工厂绕过了 run() 交互路径，故未暴露）；
+  2. 键盘绑定只在 top 上；托盘后台进程被 OS 前台锁拦 `SetForegroundWindow` 时
+     Enter/Esc 送达不到遮罩（`overrideredirect` 窗口 focus_force 不可靠）；
+  3. Qt 主环下 `QTimer _tick` + `root.after _tick` **双源泵**互相复利：repro 实测
+     `_pump` 调用 340→1102→1549 次/秒（单源稳态应 ≈66），root 销毁后仍残留数百
+     个 `invalid command name _tick` 定时器 → 越跑越卡直至假死、内存缓涨。
+  修复：① run() 统一为**自检 `_done` 的轮询环 + finally 强制 destroy/解绑/释放图像**，
+  任何异常路径遮罩必撤；② `bind_all` Return/Escape + AttachThreadInput 强抢前台；
+  ③ **线程所有权**：Qt 模式下 tkinter 全部对象（遮罩/热键对话框）迁入专属
+  `TkUiThread` 自持 mainloop，主线程只经队列收发（`region_ready` 等事件），
+  **跨线程零触碰 Tk**；QTimer 单源泵 events 队列，`_pump` 不再 update Tk；
+  ④ 逃生三保险：遮罩内 **120s 无操作看门狗**（自动取消）、**Ctrl+Alt+Q 全局中止
+  热键**（不依赖键盘焦点，置 threading.Event 由轮询环 100ms 内撤罩）、截图防重入
+  + 150s 主环兜底解锁。repro 实测：watchdog 0.64s 自撤、abort 0.45s 自撤。
+- **P0-B 驻留内存增长**。头号嫌疑逐一排除（`tests/soak_capture.py`，30 轮完整
+  "截图→识别→剪贴板→预览"）：① Edge 截图子进程改为**显式 Popen 跟踪 + wait 收尸
+  + 超时 kill + close() 统一清扫**，末测残留进程 0；② 全屏冻结图（每张几十 MB）
+  改**即抛路径**：overlay finally `del photo/frozen + gc`、capture_region 裁剪后即
+  `del frozen`、tray 落盘后 `del img`；③ worker 任务级异常也保证结果回投（错误
+  可见不静默）。soak 实测：RSS 增幅 **+4MB**（预算 <50MB）、句柄 658→655 稳定。
 
 ## M3c 功能（修改快捷键 + 检查更新，2026-09-25）
 

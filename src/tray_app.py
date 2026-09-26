@@ -248,6 +248,79 @@ def hotkey_capture_dialog(root, current_spec: str) -> "str | None":
     return state["result"]
 
 
+class TkUiThread(threading.Thread):
+    """Qt 模式专属 Tk 线程：拥有 root、截图遮罩与所有 tkinter 对话框。
+
+    线程所有权纪律（M3e P0 修复核心）：
+      - tkinter 非线程安全：**本线程之外无人可触碰 self.root 及任何 Tk 对象**；
+      - 主线程（Qt）只经 jobs 队列下发工作、经 app.events 收结果；
+      - mainloop 常驻本线程，overlay 的模态轮询环/对话框 wait 循环都跑在这里，
+        Qt 心跳不再"代泵" Tk（旧双源 QTimer+after 泵是定时器风暴/假死根因之一）。
+    """
+
+    def __init__(self, app):
+        super().__init__(daemon=True, name="snipeq-tkui")
+        self.app = app
+        self.root = None
+        self.ready = threading.Event()
+        self.jobs: queue.Queue = queue.Queue()
+
+    def run(self) -> None:
+        import tkinter as tk
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title("SnipEq-TkUI")
+        self.root.after(40, self._drain)
+        self.ready.set()
+        try:
+            self.root.mainloop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                job = self.jobs.get_nowait()
+                try:
+                    self._exec(job)
+                except Exception:  # noqa: BLE001 单 job 异常不断环
+                    log(f"TkUI job {job[0]} 异常:\n" + traceback.format_exc())
+                    if job[0] == "capture":
+                        self.app.post("region_ready", None, None)
+        except queue.Empty:
+            pass
+        if self.root is not None:
+            try:
+                self.root.after(40, self._drain)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _exec(self, job) -> None:
+        kind = job[0]
+        app = self.app
+        if kind == "capture":
+            app._abort_capture.clear()
+            factory = app.overlay_factory or capture.TkOverlay
+            img, rect = capture.capture_region(root=self.root, overlay_factory=factory,
+                                               abort_event=app._abort_capture)
+            if img is None:
+                app.post("region_ready", None, None)
+                return
+            path = os.path.join(tempfile.gettempdir(),
+                                f"snipeq_shot_{int(time.time() * 1000)}.png")
+            img.save(path)
+            del img
+            app.post("region_ready", path, rect)
+        elif kind == "hotkey_dialog":
+            spec = hotkey_capture_dialog(self.root, app.hotkey_spec)
+            app.post("hotkey_dialog_done", spec)
+        elif kind == "tk_quit":
+            try:
+                self.root.quit()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class SnipEqApp:
     def __init__(
         self,
@@ -278,7 +351,10 @@ class SnipEqApp:
         self.rec_last_use = 0.0
         self.preview = None                        # PreviewRenderer（内部锁，线程安全）
         self._preview_lock = threading.Lock()
-        self.root = None                           # 隐藏 tk.Tk（overlay 宿主）
+        self.root = None                           # tk.Tk：tk 降级模式=主线程持有；
+        self.tkui = None                           # Qt 模式=TkUiThread 持有（跨线程禁触）
+        self._abort_capture = threading.Event()    # Ctrl+Alt+Q 中止遮罩（overlay 轮询读）
+        self._capturing = False                    # 截图防重入
         self.icon = None                           # pystray.Icon
         self.hotkey_mgr = None
         self.card = None
@@ -295,22 +371,41 @@ class SnipEqApp:
 
     # ------------------------------------------------------------ 生命周期
     def run(self, smoke_seconds: float = 0.0, once_image: str | None = None) -> int:
-        import tkinter as tk
+        """主环启动。
+
+        **P0 修复（M3e）线程所有权**：Qt 模式下 tkinter 全部对象（overlay/对话框）
+        归**专属 Tk 线程**（TkUiThread）持有并自持 mainloop；主线程 QTimer 只消费
+        events 队列、**绝不跨线程碰 Tk**——修掉旧结构里"QTimer _tick + root.after
+        _tick 双源泵 + 主线程 root.update()"的定时器复利风暴（越跑越卡→假死+内存
+        增长的第二根因）。tk 降级模式（无 PySide6/强制）保持旧单线程结构：
+        root 属主线程，after 单源泵，overlay 同步跑（无 Qt 即无双源问题）。
+        """
+        if not self.ui_degraded:
+            self.tkui = TkUiThread(self)
+            self.tkui.start()
+            if not self.tkui.ready.wait(5):
+                log("Tk UI 线程启动超时，转降级模式")
+                self.ui_degraded = True
+                self.tkui = None
+
+        if self.ui_degraded:
+            import tkinter as tk
+            self.root = tk.Tk()
+            self.root.withdraw()
+            try:
+                self.root.title("SnipEq")
+            except Exception:  # noqa: BLE001
+                pass
 
         capture.ensure_dpi_aware()
         try:
             cleanup_temp(24.0, log=log)
         except Exception as e:  # noqa: BLE001  清理失败不阻塞启动
             log(f"temp 清理异常: {e}")
-        self.root = tk.Tk()
-        self.root.withdraw()
-        try:
-            self.root.title("SnipEq")
-        except Exception:  # noqa: BLE001
-            pass
 
         self._start_tray()
         self._start_hotkey()
+        self._start_abort_hotkey()
 
         if smoke_seconds > 0:
             self._timer(smoke_seconds, lambda: self.post("quit"))
@@ -333,14 +428,15 @@ class SnipEqApp:
         threading.Thread(target=_later, daemon=True).start()
 
     def _run_tk_main(self) -> None:
+        # 降级模式：root 属主线程，after 单源泵（无 Qt 即无双源问题）
         self.root.after(30, self._tick)
         self.root.mainloop()
 
     def _tick(self) -> None:
-        """30ms 主环心跳（tk after 自注册；Qt 主环下由 QTimer 拉起并转发 after，
-        保证对话框等 tkinter 事件在两种主环里都被调度）。"""
+        """心跳。Qt 模式只由 QTimer 触发（单源，不重注册 after）；
+        tk 模式由 after 链自注册。两模式各自只存在一条调度线。"""
         self._pump()
-        if self.root is not None and not self._stop.is_set():
+        if self.ui_degraded and self.root is not None and not self._stop.is_set():
             try:
                 self.root.after(30, self._tick)
             except Exception:  # noqa: BLE001
@@ -363,7 +459,9 @@ class SnipEqApp:
         app.exec()
 
     def _pump(self) -> None:
-        """主环心跳：处理事件队列 + 泵 tkinter（Qt 主环时 overlay 需要 update）。"""
+        """主环心跳：只消费 events 队列。**绝不触碰 Tk 对象**——Qt 模式下 Tk 属
+        TkUiThread（tkinter 非线程安全，跨线程 update()/after() 即 M3e 双泵根因）；
+        tk 模式的事件调度由 mainloop 自身完成。"""
         try:
             while True:
                 kind, args = self.events.get_nowait()
@@ -373,22 +471,17 @@ class SnipEqApp:
                     log(f"事件 {kind} 处理异常:\n" + traceback.format_exc())
         except queue.Empty:
             pass
-        if self.root is not None and not self.ui_degraded:
-            # Qt 主环下 tkinter 不会自转，需手动泵（overlay 依赖）
-            try:
-                self.root.update_idletasks()
-                self.root.update()
-            except Exception:  # noqa: BLE001
-                pass
 
     def _shutdown(self) -> None:
         self._stop.set()
+        self._abort_capture.set()
         self.tasks.put(("exit",))
-        if self.hotkey_mgr:
-            try:
-                self.hotkey_mgr.stop()
-            except Exception:  # noqa: BLE001
-                pass
+        for mgr in (self.hotkey_mgr, getattr(self, "abort_mgr", None)):
+            if mgr:
+                try:
+                    mgr.stop()
+                except Exception:  # noqa: BLE001
+                    pass
         if self.icon:
             try:
                 self.icon.stop()
@@ -448,6 +541,27 @@ class SnipEqApp:
         self.icon = pystray.Icon("SnipEq", make_icon_image(), "SnipEq 公式快贴", menu)
         self.icon.run_detached()
 
+    def _show_msg(self, kind: str, title: str, msg: str) -> bool:
+        """用户消息框。Qt 模式→QMessageBox（主线程合法）；
+        降级模式→tk messagebox（root 属主线程）。返回 askokcancel 语义布尔。"""
+        if not self.ui_degraded:
+            try:
+                from PySide6.QtWidgets import QMessageBox
+                box = QMessageBox()
+                if kind == "okcancel":
+                    box.setIcon(QMessageBox.Question)
+                    box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+                    return box.exec() == QMessageBox.Ok
+                box.setIcon(QMessageBox.Warning if kind == "error"
+                            else QMessageBox.Information)
+                box.setText(msg)
+                box.setWindowTitle(title)
+                box.exec()
+                return True
+            except Exception:  # noqa: BLE001
+                pass
+        return _tk_msgbox(self.root, kind, title, msg)
+
     def _make_hotkey(self, spec: str) -> "capture.HotkeyManager":
         mgr = capture.HotkeyManager(spec, lambda: self.post("capture"))
         mgr.start()
@@ -461,11 +575,37 @@ class SnipEqApp:
             self.hotkey_mgr = None
             log(f"热键注册失败（仅托盘菜单可用）: {e}")
 
+    def _start_abort_hotkey(self) -> None:
+        """P0 逃生：第二全局热键 Ctrl+Alt+Q 无条件中止截图遮罩
+        （不依赖遮罩键盘焦点——前台锁场景下 Enter/Esc 可能进不了窗口）。"""
+        try:
+            self.abort_mgr = capture.HotkeyManager(
+                "ctrl+alt+q", self._on_abort_hotkey)
+            self.abort_mgr.start()
+            log("中止热键已注册: ctrl+alt+q")
+        except Exception as e:  # noqa: BLE001
+            self.abort_mgr = None
+            log(f"中止热键注册失败（看门狗 120s 仍兜底）: {e}")
+
+    def _on_abort_hotkey(self) -> None:
+        # 热键线程 → 仅置事件（overlay 轮询环 100ms 内自撤），不碰任何 UI 对象
+        self._abort_capture.set()
+
     # ------------------------------------------------------------ 修改快捷键（M3c）
 
     def _on_change_hotkey(self) -> None:
-        """主线程：弹捕获对话框 → 校验 → 换键（先注销旧键，冲突回滚并弹错）。"""
+        """修改快捷键：Qt 模式对话框下发 Tk 线程（结果经 hotkey_dialog_done 回），
+        降级模式主线程直接弹。校验链在 _apply_new_hotkey。"""
+        if not self.ui_degraded and self.tkui is not None:
+            self.tkui.jobs.put(("hotkey_dialog",))
+            return
         spec = hotkey_capture_dialog(self.root, self.hotkey_spec)
+        self._apply_new_hotkey(spec)
+
+    def _on_hotkey_dialog_done(self, spec) -> None:
+        self._apply_new_hotkey(spec)
+
+    def _apply_new_hotkey(self, spec) -> None:
         if spec is None or spec == self.hotkey_spec:
             return
         ok_, msg = self._swap_hotkey(spec)
@@ -475,10 +615,10 @@ class SnipEqApp:
                 self.settings.save()
             except Exception as e:  # noqa: BLE001
                 log(f"settings 保存失败: {e}")
-            _tk_msgbox(self.root, "okinfo", "快捷键已更新", msg)
+            self._show_msg("okinfo", "快捷键已更新", msg)
             log(f"快捷键已热更新: {spec}")
         else:
-            _tk_msgbox(self.root, "error", "快捷键修改失败", msg)
+            self._show_msg("error", "快捷键修改失败", msg)
             log(f"快捷键修改失败已回滚: {spec} → {msg}")
 
     def _swap_hotkey(self, new_spec: str) -> "tuple[bool, str]":
@@ -529,9 +669,9 @@ class SnipEqApp:
         status = info.get("status")
         if status == "new_version":
             import webbrowser
-            if _tk_msgbox(self.root, "okcancel", "发现新版本",
-                          f"发现新版本 {info.get('latest')}（当前 v{__version__}）\n\n"
-                          f"{info.get('name', '')}\n\n打开浏览器前往下载页？"):
+            if self._show_msg("okcancel", "发现新版本",
+                              f"发现新版本 {info.get('latest')}（当前 v{__version__}）\n\n"
+                              f"{info.get('name', '')}\n\n打开浏览器前往下载页？"):
                 webbrowser.open(info.get("url") or "")
         elif status == "up_to_date":
             self._notify("检查更新", f"已是最新版本（v{__version__}）")
@@ -545,6 +685,12 @@ class SnipEqApp:
     # ------------------------------------------------------------ 主线程事件
     def _on_quit(self) -> None:
         self._stop.set()
+        self._abort_capture.set()          # 若遮罩在途，热键层直接撤下
+        if self.tkui is not None:
+            try:
+                self.tkui.jobs.put(("tk_quit",))
+            except Exception:  # noqa: BLE001
+                pass
         try:
             from PySide6.QtWidgets import QApplication
             app = QApplication.instance()
@@ -595,20 +741,48 @@ class SnipEqApp:
         self._on_result(latex, None, None, None)
 
     def _on_capture(self) -> None:
-        """主线程：弹遮罩选区 → 交 worker 跑管线。"""
-        factory = self.overlay_factory or capture.TkOverlay
+        """截图入口（事件环）。Qt 模式把遮罩工作下发 Tk 线程（结果经
+        region_ready 事件回来）；降级模式主线程同步弹遮罩（旧行为）。
+        防重入：遮罩在途时忽略新的 capture 事件。"""
+        if self._capturing:
+            log("截图已在进行中，忽略重入触发")
+            return
+        self._capturing = True
+        # 兜底：150s 后若还没收到 region_ready（Tk 线程意外卡死），解锁截图态
+        self._timer(150.0, lambda: self.post("capture_stuck"))
+        if not self.ui_degraded and self.tkui is not None:
+            self.tkui.jobs.put(("capture",))
+            return
         try:
-            img, rect = capture.capture_region(root=self.root, overlay_factory=factory)
+            factory = self.overlay_factory or capture.TkOverlay
+            self._abort_capture.clear()
+            img, rect = capture.capture_region(
+                root=self.root, overlay_factory=factory,
+                abort_event=self._abort_capture)
+            if img is None:
+                return
+            path = os.path.join(tempfile.gettempdir(),
+                                f"snipeq_shot_{int(time.time() * 1000)}.png")
+            img.save(path)
+            del img
+            self._enqueue_pipeline(path, rect)
         except Exception:  # noqa: BLE001
             log("截图异常:\n" + traceback.format_exc())
             self._notify("截图失败", "capture 异常，见日志")
-            return
-        if img is None:
-            return
-        path = os.path.join(tempfile.gettempdir(),
-                            f"snipeq_shot_{int(time.time() * 1000)}.png")
-        img.save(path)
-        self._enqueue_pipeline(path, rect)
+        finally:
+            self._capturing = False
+
+    def _on_capture_stuck(self) -> None:
+        if self._capturing:
+            log("截图态 150s 未返回 → 强制解锁（遮罩可能已被看门狗/abort 撤下）")
+            self._abort_capture.set()
+            self._capturing = False
+
+    def _on_region_ready(self, png_path, rect) -> None:
+        """Tk 线程截图完成（png_path=None 表示取消/超时/中止）。"""
+        self._capturing = False
+        if png_path:
+            self._enqueue_pipeline(png_path, rect)
 
     def _enqueue_pipeline(self, image_path: str, rect) -> None:
         self.tasks.put(("recognize", image_path, rect))
@@ -748,8 +922,15 @@ class SnipEqApp:
                 elif kind == "reprerender":
                     png = self._render_preview(task[1])
                     self.post("reprerender", task[1], png)
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                # P0 崩溃防护：任务级异常也要把结果投回主环（错误可见，绝不静默）
                 log("worker 异常:\n" + traceback.format_exc())
+                if kind == "recognize":
+                    self.post("result", None, f"识别线程异常: {e}",
+                              task[2] if len(task) > 2 else None, None,
+                              task[1] if len(task) > 1 else "")
+                elif kind == "reprerender":
+                    self.post("reprerender", task[1], None)
             self._maybe_unload()
         with self._preview_lock:
             if self.preview is not None:

@@ -88,6 +88,7 @@ class PreviewRenderer:
         self.edge_timeout = edge_timeout
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self._live_edges: list[subprocess.Popen] = []   # Edge 子进程跟踪（P0 内存治理）
         self._req_id = 0
         self.last_error: str | None = None
         self.last_timings: dict[str, float] = {}
@@ -206,17 +207,34 @@ class PreviewRenderer:
             f"--screenshot={png_path}",
             uri,
         ]
+        # P0 内存治理（M3e）：显式 Popen 跟踪句柄——正常路径 wait 收尸；
+        # 超时路径 kill 主进程并记录，close() 统一清扫存活残骸。
+        # （原 subprocess.run 超时只杀主进程但无第二道清扫；headless=new 的
+        #  zygote/child 会随主进程退出由 OS 回收，实测计数见 soak_capture。）
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self._live_edges.append(proc)
         try:
-            subprocess.run(cmd, capture_output=True, timeout=self.edge_timeout)
+            proc.wait(timeout=self.edge_timeout)
         except subprocess.TimeoutExpired:
-            self.last_error = f"Edge 截图超时(>{self.edge_timeout}s)"
+            self.last_error = f"Edge 截图超时(>{self.edge_timeout}s)，kill pid={proc.pid}"
+            try:
+                proc.kill()
+            except OSError:
+                pass
             html_path.unlink(missing_ok=True)
+            self._reap_edges()
             return False
         html_path.unlink(missing_ok=True)
+        self._reap_edges()
         if not png_path.is_file():
             self.last_error = "Edge 截图失败（未产出 PNG）"
             return False
         return self._tight_crop(png_path)
+
+    def _reap_edges(self) -> None:
+        """移除已退出子进程的跟踪记录（poll 非 None 即已回收，无僵尸）。"""
+        self._live_edges = [p for p in self._live_edges if p.poll() is None]
 
     @staticmethod
     def _tight_crop(png_path: Path, pad: int = 6) -> bool:
@@ -310,6 +328,14 @@ try {{
         im.resize((nw, nh), Image.LANCZOS).save(png_path)
 
     def close(self) -> None:
+        # Edge 残骸统一清扫（超时未退的 kill；已退的由 poll 判定自然出局）
+        for p in list(self._live_edges):
+            try:
+                if p.poll() is None:
+                    p.kill()
+            except OSError:
+                pass
+        self._live_edges = []
         if self._proc is not None and self._proc.stdin is not None:
             try:
                 self._proc.stdin.write('{"cmd":"quit"}\n')

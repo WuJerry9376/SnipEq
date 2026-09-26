@@ -259,16 +259,51 @@ def grab_fullscreen() -> tuple["object", tuple[int, int]]:
 
 # ---------------------------------------------------------------- ③ tkinter 遮罩
 
+def _steal_foreground(top) -> None:
+    """后台托盘进程经全局热键唤起时，OS 前台锁会拒绝 SetForegroundWindow
+    （overrideredirect 窗口 focus_force 亦无效）→ Enter/Esc 进不了遮罩。
+    技巧：AttachThreadInput 绑到当前前台线程再抢，失败静默（仍有 bind_all/看门狗
+    /abort 热键三路兜底）。"""
+    try:
+        user32 = _user32
+        kernel32 = ctypes.windll.kernel32
+        fg = user32.GetForegroundWindow()
+        fg_tid = kernel32.GetWindowThreadProcessId(wintypes.HWND(fg), None)
+        cur_tid = kernel32.GetCurrentThreadId()
+        if fg_tid and fg_tid != cur_tid:
+            kernel32.AttachThreadInput(cur_tid, fg_tid, True)
+        hwnd = wintypes.HWND(int(top.winfo_id()))
+        root_hwnd = wintypes.HWND(user32.GetAncestor(hwnd, 2))  # GA_ROOT
+        user32.BringWindowToTop(root_hwnd)
+        user32.SetForegroundWindow(root_hwnd)
+        user32.SetFocus(root_hwnd)
+        if fg_tid and fg_tid != cur_tid:
+            kernel32.AttachThreadInput(cur_tid, fg_tid, False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class TkOverlay:
     """tkinter 无边框置顶遮罩（默认 overlay 实现，可被 overlay_factory 替换）。
 
     协议：构造 (frozen, offset, parent=None)；run() 阻塞至完成，
-    返回冻结图坐标 (x0, y0, x1, y1) 或 None（取消）。
+    返回冻结图坐标 (x0,y0,x1,y1) 或 None（取消/Esc/右键/看门狗超时/abort 事件）。
+
+    **P0 修复（M3e，v0.1.1）**——办公机实锤"确认后卡死在遮罩、整机假死"：
+    - 根因1：tray 复用分支原用 `root.wait_window(top)`，而 confirm/cancel 只设
+      `_done` 标志从不销毁 top → wait_window 永 Returns，遮罩永不消失。现统一为
+      **自检 `_done` 的轮询循环**（两种宿主模式同一语义），并以 `finally` 强制
+      destroy 窗口 + 释放 PhotoImage/frozen 引用。
+    - 根因2：键盘绑定在 top 上，焦点被 OS 前台锁/子控件分流时 Enter/Esc 失效。
+      现 **bind_all 到 root**（全局捕获 Return/Escape）+ AttachThreadInput 强抢
+      前台焦点；即便键盘仍不可达，看门狗与全局 abort 热键保证 120s/一键逃生。
     """
 
-    MIN_SIZE = 4  # 选区最小边长（像素）
+    MIN_SIZE = 4       # 选区最小边长（像素）
+    WATCHDOG_S = 120.0  # 无操作自动取消（秒）
 
-    def __init__(self, frozen, offset: tuple[int, int], parent=None):
+    def __init__(self, frozen, offset: tuple[int, int], parent=None,
+                 watchdog_s: float | None = None):
         self.frozen = frozen
         self.offset = offset
         self._parent = parent
@@ -276,6 +311,19 @@ class TkOverlay:
         self._start: tuple[int, int] | None = None
         self._cur: tuple[int, int] | None = None
         self._done = False
+        self._cancel_reason: str | None = None
+        self._abort_event = None            # threading.Event，由 set_abort_event 注入
+        self._watchdog_s = watchdog_s if watchdog_s is not None else self.WATCHDOG_S
+        self._last_activity = time.monotonic()
+        self._bind_tokens = None            # (root, tokReturn, tokEscape)
+
+    # 供宿主注入"立即中止"事件（Ctrl+Alt+Q 全局热键路径）
+    def set_abort_event(self, ev) -> None:
+        self._abort_event = ev
+
+    @property
+    def cancel_reason(self) -> str | None:
+        return self._cancel_reason
 
     def run(self):
         import tkinter as tk
@@ -283,107 +331,156 @@ class TkOverlay:
 
         own_root = self._parent is None
         root = self._parent if not own_root else tk.Tk()
-        top = tk.Toplevel(root)
-        top.overrideredirect(True)
-        top.attributes("-topmost", True)
-        w, h = self.frozen.size
-        vx, vy = self.offset
-        top.geometry(f"{w}x{h}+{vx}+{vy}")
-        canvas = tk.Canvas(top, width=w, height=h, highlightthickness=0,
-                           cursor="crosshair", bg="black")
-        canvas.pack(fill="both", expand=True)
-        photo = ImageTk.PhotoImage(self.frozen)
-        canvas.create_image(0, 0, anchor="nw", image=photo)
-        canvas.image_ref = photo  # 持引用防 GC 白屏
+        top = None
+        photo = None
+        try:
+            top = tk.Toplevel(root)
+            top.overrideredirect(True)
+            top.attributes("-topmost", True)
+            w, h = self.frozen.size
+            vx, vy = self.offset
+            top.geometry(f"{w}x{h}+{vx}+{vy}")
+            canvas = tk.Canvas(top, width=w, height=h, highlightthickness=0,
+                               cursor="crosshair", bg="black")
+            canvas.pack(fill="both", expand=True)
+            photo = ImageTk.PhotoImage(self.frozen)
+            canvas.create_image(0, 0, anchor="nw", image=photo)
+            canvas.image_ref = photo  # 持引用防 GC 白屏
 
-        def redraw(*_):
-            canvas.delete("rubber")
-            if not (self._start and self._cur):
-                return
-            x0, y0 = self._start
-            x1, y1 = self._cur
-            x0, x1 = min(x0, x1), max(x0, x1)
-            y0, y1 = min(y0, y1), max(y0, y1)
-            # 选区外 4 块半透明黑蒙版（stipple 模拟 alpha）
-            for rx0, ry0, rx1, ry1 in (
-                (0, 0, w, y0), (0, y1, w, h),
-                (0, y0, x0, y1), (x1, y0, w, y1),
-            ):
-                if rx1 > rx0 and ry1 > ry0:
-                    canvas.create_rectangle(rx0, ry0, rx1, ry1, fill="black",
-                                            stipple="gray50", outline="", tags="rubber")
-            canvas.create_rectangle(x0, y0, x1, y1, outline="#ff3355", width=2,
-                                    tags="rubber")
+            def redraw(*_):
+                canvas.delete("rubber")
+                if not (self._start and self._cur):
+                    return
+                x0, y0 = self._start
+                x1, y1 = self._cur
+                x0, x1 = min(x0, x1), max(x0, x1)
+                y0, y1 = min(y0, y1), max(y0, y1)
+                # 选区外 4 块半透明黑蒙版（stipple 模拟 alpha）
+                for rx0, ry0, rx1, ry1 in (
+                    (0, 0, w, y0), (0, y1, w, h),
+                    (0, y0, x0, y1), (x1, y0, w, y1),
+                ):
+                    if rx1 > rx0 and ry1 > ry0:
+                        canvas.create_rectangle(rx0, ry0, rx1, ry1, fill="black",
+                                                stipple="gray50", outline="", tags="rubber")
+                canvas.create_rectangle(x0, y0, x1, y1, outline="#ff3355", width=2,
+                                        tags="rubber")
 
-        def press(e):
-            self._start, self._cur = (e.x, e.y), (e.x, e.y)
-            redraw()
+            def bump(*_):
+                self._last_activity = time.monotonic()
 
-        def drag(e):
-            self._cur = (e.x, e.y)
-            redraw()
-
-        def finish_box() -> tuple[int, int, int, int] | None:
-            if not (self._start and self._cur):
-                return None
-            x0, x1 = sorted((self._start[0], self._cur[0]))
-            y0, y1 = sorted((self._start[1], self._cur[1]))
-            if x1 - x0 < self.MIN_SIZE or y1 - y0 < self.MIN_SIZE:
-                return None
-            return (x0, y0, x1, y1)
-
-        def release(_e):
-            # 松开即显示选区，Enter 确认（SnipPaste 式两段操作）；过小视为误触
-            if finish_box() is None:
-                self._start = self._cur = None
+            def press(e):
+                bump()
+                self._start, self._cur = (e.x, e.y), (e.x, e.y)
                 redraw()
 
-        def confirm(_e=None):
-            box = finish_box()
-            if box is not None:
-                self._box = box
+            def drag(e):
+                bump()
+                self._cur = (e.x, e.y)
+                redraw()
+
+            def finish_box() -> tuple[int, int, int, int] | None:
+                if not (self._start and self._cur):
+                    return None
+                x0, x1 = sorted((self._start[0], self._cur[0]))
+                y0, y1 = sorted((self._start[1], self._cur[1]))
+                if x1 - x0 < self.MIN_SIZE or y1 - y0 < self.MIN_SIZE:
+                    return None
+                return (x0, y0, x1, y1)
+
+            def release(_e):
+                bump()
+                if finish_box() is None:
+                    self._start = self._cur = None
+                    redraw()
+
+            def confirm(_e=None):
+                box = finish_box()
+                if box is not None:
+                    self._box = box
+                    self._done = True
+
+            def cancel(_e=None, reason: str = "cancel"):
+                self._box = None
+                self._cancel_reason = reason
                 self._done = True
 
-        def cancel(_e=None):
-            self._box = None
-            self._done = True
+            canvas.bind("<ButtonPress-1>", press)
+            canvas.bind("<B1-Motion>", drag)
+            canvas.bind("<ButtonRelease-1>", release)
+            canvas.bind("<ButtonPress-3>", lambda e: cancel(e, "rightclick"))
+            canvas.bind("<Double-Button-1>", confirm)  # 双击快速确认
+            canvas.bind("<Motion>", bump)
+            # 键盘全局绑定（bind_all 覆盖焦点在任意子控件/漏前台的情形）；
+            # 记录 token，finally 里解绑防泄漏到后续会话
+            tok_r = root.bind_all("<Return>", confirm, add="+")
+            tok_e = root.bind_all("<Escape>", lambda e: cancel(e, "esc"), add="+")
+            self._bind_tokens = (root, tok_r, tok_e)
 
-        canvas.bind("<ButtonPress-1>", press)
-        canvas.bind("<B1-Motion>", drag)
-        canvas.bind("<ButtonRelease-1>", release)
-        top.bind("<Return>", confirm)
-        top.bind("<Escape>", cancel)
-        canvas.bind("<ButtonPress-3>", cancel)  # 右键取消
-        canvas.bind("<Double-Button-1>", confirm)  # 双击快速确认
+            top.focus_force()
+            _steal_foreground(top)
 
-        top.focus_force()
-        if own_root:
+            # 统一轮询环：_done / watchdog / abort_event 三出口，绝不依赖
+            # wait_window 的 destroy 语义（P0 根因所在）
             while not self._done:
-                root.update_idletasks()
-                root.update()
+                if self._abort_event is not None and self._abort_event.is_set():
+                    cancel(reason="abort_hotkey")
+                    break
+                if time.monotonic() - self._last_activity > self._watchdog_s:
+                    cancel(reason="watchdog")
+                    break
+                top.update_idletasks()
+                top.update()
                 time.sleep(0.01)
-            root.destroy()
-        else:
-            root.wait_window(top)
-        return self._box
+            return self._box
+        finally:
+            # 任何异常/取消路径：撤遮罩、解全局绑定、释放图像引用（P0 逃生承诺）
+            try:
+                tkd = getattr(self, "_bind_tokens", None)
+                if tkd is not None:
+                    r, t_r, t_e = tkd
+                    r.unbind_all("<Return>", t_r)
+                    r.unbind_all("<Escape>", t_e)
+            except Exception:  # noqa: BLE001
+                pass
+            for closer in (lambda: top is not None and top.destroy(),
+                           lambda: own_root and root.destroy()):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    pass
+            del photo  # 先释 ImageTk，再断 frozen（几十 MB 级全屏图即抛）
+            self.frozen = None
+            photo = None
+            try:
+                import gc
+                gc.collect()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------- ④ 组合口
 
-def capture_region(root=None, overlay_factory=None):
+def capture_region(root=None, overlay_factory=None, abort_event=None):
     """全屏冻结 → 遮罩选区。返回 (选区 PIL.Image | None, 物理矩形 (x,y,w,h) | None)。
 
     overlay_factory(frozen, offset, parent=root) -> overlay（.run() 返回
     冻结图坐标 (x0,y0,x1,y1) 或 None）。缺省 TkOverlay；des-1 换 PySide6 遮罩时
     只需替换此工厂。测试/零交互注入：传 full_image_factory 即取全图。
+    abort_event（threading.Event）：TkOverlay 支持时注入，供全局中止热键
+    （Ctrl+Alt+Q）在不依赖键盘焦点的情况下撤掉遮罩。
     """
     frozen, offset = grab_fullscreen()
     overlay = (overlay_factory or TkOverlay)(frozen, offset, root)
+    if abort_event is not None and hasattr(overlay, "set_abort_event"):
+        overlay.set_abort_event(abort_event)
     box = overlay.run()
     if box is None:
+        del frozen
         return None, None
     x0, y0, x1, y1 = box
     img = frozen.crop((x0, y0, x1, y1))
+    del frozen  # 全屏底图即抛（选区 img 独立内存；overlay 已释放其引用）
     vx, vy = offset
     return img, (vx + x0, vy + y0, x1 - x0, y1 - y0)
 
