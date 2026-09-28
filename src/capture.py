@@ -263,22 +263,36 @@ def _steal_foreground(top) -> None:
     """后台托盘进程经全局热键唤起时，OS 前台锁会拒绝 SetForegroundWindow
     （overrideredirect 窗口 focus_force 亦无效）→ Enter/Esc 进不了遮罩。
     技巧：AttachThreadInput 绑到当前前台线程再抢，失败静默（仍有 bind_all/看门狗
-    /abort 热键三路兜底）。"""
+    /abort 热键三路兜底）。
+    **64 位纪律**：HWND 一律 c_void_p 承接/传递（默认 c_int 会截断句柄，
+    VM 实测截断时 SetForegroundWindow 假成功或静默失败）。"""
     try:
-        user32 = _user32
-        kernel32 = ctypes.windll.kernel32
-        fg = user32.GetForegroundWindow()
-        fg_tid = kernel32.GetWindowThreadProcessId(wintypes.HWND(fg), None)
-        cur_tid = kernel32.GetCurrentThreadId()
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        u.GetAncestor.restype = wintypes.HWND
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.SetForegroundWindow.restype = wintypes.BOOL
+        u.BringWindowToTop.argtypes = [wintypes.HWND]
+        u.SetFocus.argtypes = [wintypes.HWND]
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        u.AttachThreadInput.restype = wintypes.BOOL
+        k.GetCurrentThreadId.restype = wintypes.DWORD
+        fg = u.GetForegroundWindow()
+        fg_tid = u.GetWindowThreadProcessId(fg, None) or 0
+        cur_tid = k.GetCurrentThreadId()
         if fg_tid and fg_tid != cur_tid:
-            kernel32.AttachThreadInput(cur_tid, fg_tid, True)
-        hwnd = wintypes.HWND(int(top.winfo_id()))
-        root_hwnd = wintypes.HWND(user32.GetAncestor(hwnd, 2))  # GA_ROOT
-        user32.BringWindowToTop(root_hwnd)
-        user32.SetForegroundWindow(root_hwnd)
-        user32.SetFocus(root_hwnd)
+            u.AttachThreadInput(cur_tid, fg_tid, True)
+        client = wintypes.HWND(top.winfo_id())
+        root_h = u.GetAncestor(client, 2) or client  # GA_ROOT
+        u.BringWindowToTop(root_h)
+        u.SetForegroundWindow(root_h)
+        u.SetFocus(root_h)
         if fg_tid and fg_tid != cur_tid:
-            kernel32.AttachThreadInput(cur_tid, fg_tid, False)
+            u.AttachThreadInput(cur_tid, fg_tid, False)
     except Exception:  # noqa: BLE001
         pass
 

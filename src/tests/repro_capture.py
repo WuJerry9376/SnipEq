@@ -62,26 +62,72 @@ def focused_hwnd(pid_tid) -> tuple[int, int]:
     return 0, 0
 
 
-def sendinput_enter() -> int:
-    """SendInput 一次真实 Enter 键（OS 级注入）。返回实际注入的事件数
-    （0=被系统拒绝，如 UIPI/非交互会话，此时 E2 证据降级为 B 级）。"""
-    INPUT_KEYBOARD, VK_RETURN, KEYEVENTF_KEYUP = 1, 0x0D, 0x0002
+def _input_structs():
+    """官方 40B INPUT 布局（x64）。所有 SendInput 探针共用。"""
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_ulonglong)]
 
-    class KI(ctypes.Structure):
+    class KEYBDINPUT(ctypes.Structure):
         _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
                     ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+                    ("dwExtraInfo", ctypes.c_ulonglong)]
 
-    class I(ctypes.Structure):
-        class U(ctypes.Union):
-            _fields_ = [("ki", KI)]
+    class U(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
         _fields_ = [("type", wintypes.DWORD), ("u", U)]
 
-    down = I(type=INPUT_KEYBOARD, u=I.U(ki=KI(wVk=VK_RETURN)))
-    up = I(type=INPUT_KEYBOARD, u=I.U(ki=KI(wVk=VK_RETURN, dwFlags=KEYEVENTF_KEYUP)))
-    arr = (I * 2)(down, up)
-    n = user32.SendInput(2, ctypes.byref(arr), ctypes.sizeof(I))
-    print(f"    SendInput(Enter) -> injected={n}", flush=True)
+    assert ctypes.sizeof(INPUT) == 40, "INPUT 布局错误（非 40B 会被 SendInput 拒收 err=87）"
+    return INPUT
+
+
+def sendinput_drag(x0: int, y0: int, x1: int, y1: int) -> int:
+    """OS 级鼠标拖拽（绝对坐标归一化到虚拟屏）。返回注入事件数（0=被拒）。"""
+    INPUT = _input_structs()
+    vx = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    vy = user32.GetSystemMetrics(77)
+    vw = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+    vh = user32.GetSystemMetrics(79)
+
+    def ev(x, y, flags):
+        i = INPUT()
+        i.type = 0
+        i.u.mi.dx = int((x - vx) * 65535 / max(vw - 1, 1))
+        i.u.mi.dy = int((y - vy) * 65535 / max(vh - 1, 1))
+        i.u.mi.dwFlags = flags | 0x8000  # | ABSOLUTE
+        return i
+
+    MOVE, DOWN, UP = 0x0001, 0x0002, 0x0004
+    seq = (INPUT * 4)(ev(x0, y0, MOVE), ev(x0, y0, DOWN),
+                      ev(x1, y1, MOVE), ev(x1, y1, UP))
+    n = user32.SendInput(4, ctypes.byref(seq), ctypes.sizeof(INPUT))
+    print(f"    SendInput(drag {x0},{y0}→{x1},{y1}) -> injected={n} "
+          f"err={ctypes.get_last_error()}", flush=True)
+    return n
+
+
+def sendinput_enter() -> int:
+    """SendInput 一次真实 Enter 键（OS 级注入）。返回实际注入的事件数。
+
+    **结构体纪律**（VM 实测教训）：x64 INPUT 必须 40 字节官方布局
+    （见 _input_structs docstring），曾被误判为"注入被系统拒绝"。"""
+    INPUT = _input_structs()
+    VK_RETURN, KEYEVENTF_KEYUP = 0x0D, 0x0002
+
+    def key(up):
+        i = INPUT()
+        i.type = 1
+        i.u.ki.wVk = VK_RETURN
+        i.u.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
+        return i
+
+    arr = (INPUT * 2)(key(False), key(True))
+    n = user32.SendInput(2, ctypes.byref(arr), ctypes.sizeof(INPUT))
+    print(f"    SendInput(Enter) -> injected={n} err={ctypes.get_last_error()}",
+          flush=True)
     return n
 
 
@@ -115,12 +161,17 @@ def e1_e2() -> dict:
                ("== 遮罩拿到前台（键可达）" if fg == ov_h else "!= 遮罩未获前台 ← 键盘进不了遮罩"))
         st["probe"]["E1"] = msg
         print(f"  [E1] {msg}", flush=True)
-        # 程序化拖拽（鼠标绑定在 canvas 上，事件须打在 canvas）
+        # 拖拽：A 级真 SendInput 优先（被系统拒收时退回 B 级画布合成事件）
         canvas = next((c for c in toplevel.winfo_children()
                        if c.winfo_class() == "Canvas"), toplevel)
-        canvas.event_generate("<ButtonPress-1>", x=300, y=200)
-        canvas.event_generate("<B1-Motion>", x=500, y=320)
-        canvas.event_generate("<ButtonRelease-1>", x=500, y=320)
+        n_drag = sendinput_drag(300, 200, 500, 320)
+        if n_drag:
+            st["probe"]["drag"] = "A 级：SendInput 真实拖拽 (300,200)→(500,320)"
+        else:
+            st["probe"]["drag"] = "B 级：event_generate 画布合成拖拽（OS 注入被拒）"
+            canvas.event_generate("<ButtonPress-1>", x=300, y=200)
+            canvas.event_generate("<B1-Motion>", x=500, y=320)
+            canvas.event_generate("<ButtonRelease-1>", x=500, y=320)
         root.after(400, lambda: send_enter(toplevel))
 
     def send_enter(toplevel):

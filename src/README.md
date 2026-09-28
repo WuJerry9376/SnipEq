@@ -156,6 +156,27 @@ Enter/主按钮=复制为 Word 公式，Esc 取消；菜单含零确认/空闲�
   `del frozen`、tray 落盘后 `del img`；③ worker 任务级异常也保证结果回投（错误
   可见不静默）。soak 实测：RSS 增幅 **+4MB**（预算 <50MB）、句柄 658→655 稳定。
 
+### VM 注入限制定论（2026-09-26 诊断更新，替代早前"B 级天花板"说法）
+
+早前 repro 报"SendInput 被系统拒绝(injected=0)，降级 B 级"是**误诊**，真凶两处：
+1. **探针结构体错**：自定义 INPUT 只放 KEYBDINPUT（sizeof=32 ≠ 官方 40——union
+   须被 32B 的 MOUSEINPUT 撑起）→ SendInput 一律 `err=87 ERROR_INVALID_PARAMETER`
+   全数拒收，被误读为"环境拒绝注入"。修：`repro_capture._input_structs()` 官方
+   布局 + `sizeof==40` 断言。
+2. **capture._steal_foreground 64 位句柄截断**：`GetForegroundWindow` 未设 restype
+   （默认 c_int 截 HWND）+ `GetWindowThreadProcessId` 挂错 kernel32 且无 argtypes →
+   AttachThreadInput 拿错 tid、抢前台恒失败 → E1"遮罩未获前台"。修后
+   SetForegroundWindow=True、前台=遮罩根窗口（**此为 v0.1.1 键盘路径的落地修复**）。
+
+环境侧复测（重启 VM + 退出 ToDesk 客户端）：三桌面名一致（WinSta0/Default/Default）、
+GetCursorInfo flags=0、SendInput 拖拽 injected=4、Enter injected=2、GetAsyncKeyState
+响应正常；ToDesk_Service 残留（Stopped）与注入失败无因果。ToDesk 运行期"光标不动
+假接受"是真实的远控接管现象，退出+重启后即恢复。**结论：本机 VM 恢复 A 级验证能力**。
+repro_capture 现为 A/B 自适应（OS 注入探针成功走真实拖拽+Enter，被拒自动退回画布
+合成事件并如实标注等级）。2026-09-26 A 级实测：`level: A`、真实拖拽+Enter 关遮罩
+（run 返回 box=(300,200,500,320)）、watchdog 0.65s / abort 0.46s 双逃生复测过、
+全套回归（e2e/m2/m3i/m3a/m3c/soak）绿。办公机真机拖拽仍是最终验收口径。
+
 ## M3c 功能（修改快捷键 + 检查更新，2026-09-25）
 
 - **版本单一事实源**：`src\version.py` 的 `__version__`（snipeq/tray/update 共用；
