@@ -203,20 +203,16 @@ repro_capture 现为 A/B 自适应（OS 注入探针成功走真实拖拽+Enter�
   新实例复用旧实例（已释放）的 wndproc 指针 → 0xC0000409 崩溃；现每实例唯一类名
   + 线程退出时 UnregisterClassW。
 
-## 便携包快照漂移记录（M3b 小修回流，2026-09-25）
+## 便携包/安装器构建说明（M3 尾批收口，2026-09-28）
 
-§12.2 决策：M3a 两项即修"**小修回流 src、暂不重建便携包**"。当前
-`package\SnipEq\app\` 为 02:31 构建快照，与开发树差异如下（等 M3 尾批统一重跑
-`package\build.ps1` 同步即可；**build.ps1 无需改动**，其复制清单已覆盖下列文件）：
-
-| 文件 | 漂移内容 | 旧包用户影响 |
-|---|---|---|
-| `recognizer.py` | M3b 复读循环熔断：`_looks_repetitive`（A 滑窗子串 `REP_WINDOW=10`×`REP_MAX_REPEAT=8`；B `len>REP_TOKEN_GUARD_LEN=300` 且去重 token 比 `<REP_MIN_UNIQUE_RATIO=0.35`），命中走 RecognitionError→snipeq exit 2/托盘气泡（real060 依据） | 无熔断：955×54 长条类选区仍 3s+ 出垃圾（不崩，仅质量差） |
-| `normalize.py` | M3b 新增 N12：`\boldsymbol`→`\mathbf`（real138 依据；3.81.1 实测 boldsymbol 基本式不丢符号，改并轨动机是 Word 侧 bold-italic 变体渲染风险，见函数 docstring） | 含 `\boldsymbol` 输出按 bold-italic 原样进 MathML |
-| `tests/run_m3a_fixes.py` | 新增回归套件（熔断 3 正 6 负 + FakePipe 接线 + N12/real138 GT） | 无 |
-
-**M3c 追加漂移**（本车道按指令未动 package\，重投递由后续车道处理）：
-`app\` 需新增 `version.py`、`update.py`（**build.ps1 §6 `$pyFiles` 清单必须加入这两个文件**，
-否则包内 tray_app import 即崩），更新 `tray_app.py`（修改快捷键/检查更新/_tick 心跳重构）、
-`capture.py`（HotkeyManager 唯一类名+UnregisterClass 修复）；`app\tests` 随 /MIR 自动带上
-`run_m3c_features.py`。
+- 历史"M3b/M3c 便携包快照漂移记录"所列条目（复读熔断、N12、version.py/update.py
+  入 `$pyFiles`、tray_app/capture 改造、各新增测试套件）**已随 v0.1.0 → v0.1.2 的
+  `build.ps1` 全量重建全部同步进便携包**，漂移记录作废归档（2026-09-28）。
+- **安装器（Inno Setup 6，per-user）**：`installer\SnipEq.iss` +
+  `installer\make_installer.ps1`（调 `build.ps1 -SkipZip` 产 staging → ISCC 编译 →
+  `installer\dist\SnipEq-Setup-<ver>.exe`；`-SkipStaging` 复用现有 staging 不动
+  便携 zip）。要点：默认装 `%LOCALAPPDATA%\Programs\SnipEq`、快捷方式直启包内
+  pythonw（不走 vbs，自启口径与 settings.py 的 HKCU Run 一致故无路径漂移）、
+  卸载默认保留 `%APPDATA%\SnipEq`（交互询问、静默一律保留）、官方 Inno 6.7.3
+  无简体中文 isl 暂用英文界面（放入 `installer\Languages\ChineseSimplified.isl`
+  即自动启用）。冒烟四验（装/运行 rc=0/卸载/无残留）见 `installer\test_log.md`。

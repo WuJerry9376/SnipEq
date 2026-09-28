@@ -28,3 +28,7 @@ logs/
 desktop.ini
 
 src/ui/_demo_tmp/
+
+# installer build output (Setup exe 不入库)
+installer/dist/
+

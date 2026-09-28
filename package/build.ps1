@@ -1,5 +1,8 @@
 # build.ps1 — SnipEq 便携包组装（embedded Python 3.12.10 + venv site-packages 裁剪搬运）
-# 用法: pwsh -File package\build.ps1   （幂等，robocopy /MIR 可重跑）
+# 用法: pwsh -File package\build.ps1 [-SkipZip]
+#       -SkipZip 只产 staging（供安装器编译用，不重打便携 zip/不动发布资产）
+# 幂等（robocopy /MIR 可重跑）
+param([switch]$SkipZip)
 $ErrorActionPreference = "Stop"
 $root   = (Resolve-Path "$PSScriptRoot\..").Path        # 仓库根（脚本相对，无个人路径）
 $pkg    = "$root\package"
@@ -158,6 +161,9 @@ if ($left -gt 0) { throw "stage 内仍有 $left 个 __pycache__，拒绝打包" 
 ".pyc 残留: " + @(Get-ChildItem $stage -Recurse -File -Filter "*.pyc" -EA SilentlyContinue).Count
 
 "=== 9. 打 zip 并二次断言（zip entry 不得含 __pycache__）"
+if ($SkipZip) {
+  "  -SkipZip：staging 就绪（供安装器编译），跳过便携 zip 重打"
+} else {
 Add-Type -AssemblyName System.IO.Compression
 $zipPath = "$pkg\SnipEq-portable.zip"
 Remove-Item $zipPath -EA SilentlyContinue
@@ -171,3 +177,4 @@ if ($bad.Count -gt 0) { throw "zip 混入 $($bad.Count) 个 pycache 条目: $($b
 $zi = Get-Item $zipPath
 "zip OK: $entryN entries, {0:N0} bytes, SHA256={1}" -f $zi.Length,
     (Get-FileHash $zipPath -Algorithm SHA256).Hash
+}
