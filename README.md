@@ -66,8 +66,13 @@ that are not published with this facade**; the self-contained ones
 
 ## Known boundaries
 
-- Verified against Microsoft 365 / Word 2019+ on real office machines; older
-  builds may paste LaTeX text instead of an object (fallback path documented above).
+- **Primary target environment: Microsoft 365 (Word)** — verified on real
+  machines with the 22-case paste checklist. Word 2016 / 2019 / 2021 / LTSC
+  have a *partial* MathML clipboard importer (per Microsoft's own docs) and are
+  **best-effort, untested**: expect the fallback paths above (`$…$` + `Alt+=`,
+  or Paste-special → MathML). WPS is supported via the LaTeX-input workflow.
+  A full legacy-Word compatibility matrix is deferred to post-release
+  community feedback.
 - Recognition quality ceiling on handwriting / blurry screenshots (it is a
   small CPU model by design). Very long strip selections can trigger the
   decode-loop circuit breaker — crop tighter.
